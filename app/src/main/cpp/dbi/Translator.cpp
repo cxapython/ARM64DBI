@@ -73,7 +73,7 @@ void block_ending(ROUTER_TYPE type, BlockMeta* block_meta, uint8_t* dbi_code,
                   uint64_t target_addr, uint64_t pc) {
     // 记录翻译后代码的位置和大小
     block_meta->block_start = (void*)block_meta->code;
-    block_meta->block_size = dbi_code - (uint8_t*)block_meta->code;
+    block_meta->block_size = (uint8_t*)dbi_code - (uint8_t*)block_meta->code;
     
     // 记录原始代码的位置和大小
     block_meta->code_start = (void*)target_addr;
@@ -135,11 +135,12 @@ void Translator::scan(uint64_t target_addr, BlockMeta* block_meta, ROUTER_TYPE t
     // ===== 遍历并翻译指令 =====
     int offset = 0;
     // 安全限制：防止块溢出
-    // 每条指令翻译后可能扩展到 60+ 条（含 prolog/epilog），预留 500 条空间
-    const int max_code_size = BLOCK_SIZE - 500;  // 预留结束跳转和安全边界
+    // 每条指令翻译后可能扩展到 80+ 条（含 prolog/epilog），需要预留足够空间
+    // 预留: 结束跳转(~50) + 单条指令最大翻译(~100) + 安全边界(~100) = 250
+    const int safe_threshold = BLOCK_SIZE - 250;  // 超过此阈值就停止翻译
     auto code_start = dbi_code;
 
-    while ((dbi_code - code_start) < max_code_size) {
+    while ((dbi_code - code_start) < safe_threshold) {
         uint64_t pc = target_addr + offset;
         
         // 使用 cs_disasm_iter 进行反汇编（比 cs_disasm 更高效）
@@ -219,17 +220,24 @@ void Translator::scan(uint64_t target_addr, BlockMeta* block_meta, ROUTER_TYPE t
     }
 
     // 达到块限制时，生成跳转代码让 Router 继续翻译后续指令
-    LOGI("[Translator] Block reached code size limit (%d/%d), continuing with next block", 
-         (int)(dbi_code - code_start), max_code_size);
+    LOGI("[Translator] Block reached size threshold (%d/%d), splitting to next block", 
+         (int)(dbi_code - code_start), safe_threshold);
     
     // 计算下一条未翻译指令的地址
     uint64_t next_pc = target_addr + offset;
+    LOGI("[Translator] Splitting at PC=0x%llx, next_pc=0x%llx", 
+         (unsigned long long)(target_addr + offset - A64_INS_WIDTH), 
+         (unsigned long long)next_pc);
     
     // 生成跳转到 Router 的代码（类似 B 指令处理）
+    auto before_jump = dbi_code;
     Router::push_register(dbi_code);
     Assembler::write_value_to_reg(dbi_code, REG_X1, B_ROUTER_TYPE);
     Assembler::write_value_to_reg(dbi_code, REG_X0, next_pc);
     Assembler::br_x16_jump(dbi_code, (uint64_t)router);
+    
+    LOGI("[Translator] Jump code size: %d instructions", (int)(dbi_code - before_jump));
+    LOGI("[Translator] Total block size: %d instructions", (int)(dbi_code - (uint32_t*)block_meta->code));
     
     return block_ending(type, block_meta, (uint8_t*)dbi_code, target_addr, next_pc - A64_INS_WIDTH);
 }
@@ -261,27 +269,35 @@ void Translator::b_cond_ins_handle(uint32_t *&writer, uint64_t pc) {
     // 3. 设置路由类型
     Assembler::write_value_to_reg(writer, REG_X1, B_ROUTER_TYPE);
 
-    // 4. 生成条件分支指令（修改目标地址）
-    uint32_t instruction;
-    Assembler::modify_b_cond_addr(instruction, *(uint32_t*)translator_insn->bytes, 
-                                   *writer, *writer + A64_INS_WIDTH * 2);
-    *writer = instruction;
+    // 4. 预留条件分支指令的位置（稍后回填）
+    uint32_t* b_cond_slot = writer;
     writer++;
 
-    // 5. 生成无条件跳转（跳过 taken_path）
-    Assembler::b(instruction, *writer, *writer + A64_INS_WIDTH * 8);
-    *writer = instruction;
+    // 5. 预留无条件跳转指令的位置（稍后回填）
+    uint32_t* b_slot = writer;
     writer++;
 
     // 6. taken_path: 条件成立时的目标地址
+    uint32_t* taken_path_start = writer;
     uint64_t b_addr;
     Assembler::get_b_addr(b_addr, pc, *(uint32_t*)translator_insn->bytes);
     Assembler::write_value_to_reg(writer, REG_X0, b_addr);
     Assembler::br_x16_jump(writer, (uint64_t)router);
 
     // 7. not_taken_path: 条件不成立时继续执行下一条
+    uint32_t* not_taken_path_start = writer;
     Assembler::write_value_to_reg(writer, REG_X0, pc + A64_INS_WIDTH);
     Assembler::br_x16_jump(writer, (uint64_t)router);
+
+    // 8. 回填条件分支（跳转到 taken_path）
+    uint32_t instruction;
+    Assembler::modify_b_cond_addr(instruction, *(uint32_t*)translator_insn->bytes, 
+                                   (uint64_t)b_cond_slot, (uint64_t)taken_path_start);
+    *b_cond_slot = instruction;
+
+    // 9. 回填无条件跳转（跳转到 not_taken_path）
+    Assembler::b(instruction, (uint64_t)b_slot, (uint64_t)not_taken_path_start);
+    *b_slot = instruction;
 }
 
 /**
@@ -485,28 +501,36 @@ void Translator::cbz_ins_handle(uint32_t *&writer, uint64_t pc, bool is_cbnz) {
     auto reg = Assembler::get_cbz_reg(*(uint32_t*)translator_insn->bytes);
     bool is_64bit = Assembler::cbz_is_64bit(*(uint32_t*)translator_insn->bytes);
     
-    // 生成条件分支：跳过 1 条 B 指令
-    uint32_t cbz_instr;
-    Assembler::cbz(cbz_instr, reg, (uint64_t)writer, 
-                   (uint64_t)writer + A64_INS_WIDTH * 2, is_64bit, is_cbnz);
-    *writer = cbz_instr;
+    // 预留 CBZ/CBNZ 指令位置
+    uint32_t* cbz_slot = writer;
     writer++;
 
-    // 生成无条件跳转：跳过 taken_path（约 9 条指令）
-    uint32_t b_instr;
-    Assembler::b(b_instr, (uint64_t)writer, (uint64_t)writer + A64_INS_WIDTH * 9);
-    *writer = b_instr;
+    // 预留无条件跳转位置
+    uint32_t* b_slot = writer;
     writer++;
 
     // taken_path: 条件成立
+    uint32_t* taken_path_start = writer;
     uint64_t cbz_target_addr;
     Assembler::get_cbz_addr(cbz_target_addr, pc, *(uint32_t*)translator_insn->bytes);
     Assembler::write_value_to_reg(writer, REG_X0, cbz_target_addr);
     Assembler::br_x16_jump(writer, (uint64_t)router);
 
     // not_taken_path: 条件不成立
+    uint32_t* not_taken_path_start = writer;
     Assembler::write_value_to_reg(writer, REG_X0, pc + A64_INS_WIDTH);
     Assembler::br_x16_jump(writer, (uint64_t)router);
+
+    // 回填 CBZ/CBNZ 指令（跳转到 taken_path）
+    uint32_t cbz_instr;
+    Assembler::cbz(cbz_instr, reg, (uint64_t)cbz_slot, 
+                   (uint64_t)taken_path_start, is_64bit, is_cbnz);
+    *cbz_slot = cbz_instr;
+
+    // 回填无条件跳转（跳转到 not_taken_path）
+    uint32_t b_instr;
+    Assembler::b(b_instr, (uint64_t)b_slot, (uint64_t)not_taken_path_start);
+    *b_slot = b_instr;
 }
 
 /**
@@ -526,28 +550,36 @@ void Translator::tbz_ins_handle(uint32_t *&writer, uint64_t pc, bool is_tbnz) {
     auto reg = Assembler::get_tbz_reg(*(uint32_t*)translator_insn->bytes);
     uint8_t bit = Assembler::get_tbz_bit(*(uint32_t*)translator_insn->bytes);
     
-    // 生成条件分支
-    uint32_t tbz_instr;
-    Assembler::tbz(tbz_instr, reg, bit, (uint64_t)writer, 
-                   (uint64_t)writer + A64_INS_WIDTH * 2, is_tbnz);
-    *writer = tbz_instr;
+    // 预留 TBZ/TBNZ 指令位置
+    uint32_t* tbz_slot = writer;
     writer++;
 
-    // 生成无条件跳转
-    uint32_t b_instr;
-    Assembler::b(b_instr, (uint64_t)writer, (uint64_t)writer + A64_INS_WIDTH * 9);
-    *writer = b_instr;
+    // 预留无条件跳转位置
+    uint32_t* b_slot = writer;
     writer++;
 
     // taken_path: 条件成立
+    uint32_t* taken_path_start = writer;
     uint64_t tbz_target_addr;
     Assembler::get_tbz_addr(tbz_target_addr, pc, *(uint32_t*)translator_insn->bytes);
     Assembler::write_value_to_reg(writer, REG_X0, tbz_target_addr);
     Assembler::br_x16_jump(writer, (uint64_t)router);
 
     // not_taken_path: 条件不成立
+    uint32_t* not_taken_path_start = writer;
     Assembler::write_value_to_reg(writer, REG_X0, pc + A64_INS_WIDTH);
     Assembler::br_x16_jump(writer, (uint64_t)router);
+
+    // 回填 TBZ/TBNZ 指令（跳转到 taken_path）
+    uint32_t tbz_instr;
+    Assembler::tbz(tbz_instr, reg, bit, (uint64_t)tbz_slot, 
+                   (uint64_t)taken_path_start, is_tbnz);
+    *tbz_slot = tbz_instr;
+
+    // 回填无条件跳转（跳转到 not_taken_path）
+    uint32_t b_instr;
+    Assembler::b(b_instr, (uint64_t)b_slot, (uint64_t)not_taken_path_start);
+    *b_slot = b_instr;
 }
 
 /**

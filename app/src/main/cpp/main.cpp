@@ -369,16 +369,26 @@ void run_aes_dfa_full_demo() {
          ciphertext[12], ciphertext[13], ciphertext[14], ciphertext[15]);
     LOGI("");
     
-    // 5. DBI 追踪 AES 加密 (暂时禁用 - AES函数过于复杂导致翻译问题)
-    // TODO: 需要优化 Translator 以支持复杂函数
-    LOGI("▶ DBI 追踪 AES 加密: 暂时禁用");
-    LOGI("  注: AES 加密函数包含复杂的查表和循环，需要进一步优化翻译器");
-    LOGI("");
+    // 5. DBI 追踪 AES 加密
+    LOGI("▶ 开始 DBI 追踪 AES 加密...");
     
-    // 模拟 DFA 分析结果
-    g_total_eor_count = 176;  // AES-128: 11 轮 * 16 字节 = 176 次 EOR
+    auto traced_encrypt = (void(*)(const uint8_t*, uint8_t*))
+        DBI::trace((uint64_t)aes_encrypt_wrapper, aes_dfa_callback);
     
-    if (true) {  // 占位符，保持代码结构
+    if (traced_encrypt) {
+        uint8_t ciphertext2[16];
+        traced_encrypt(plaintext, ciphertext2);
+        
+        // 验证追踪版本的正确性
+        bool match = true;
+        for (int i = 0; i < 16; i++) {
+            if (ciphertext[i] != ciphertext2[i]) {
+                match = false;
+                break;
+            }
+        }
+        LOGI("▶ 追踪版本密文验证: %s", match ? "✓ 一致" : "✗ 不一致");
+        LOGI("");
         
         // 5. 打印分析结果
         LOGI("╔══════════════════════════════════════════════════════════════╗");

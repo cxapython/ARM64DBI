@@ -45,8 +45,17 @@ uint64_t _router(uint64_t jump_addr, ROUTER_TYPE type) {
     auto block_meta = Memory::get_cache_block_meta(jump_addr);
     if (block_meta == nullptr) {
         block_meta = Memory::get_or_new_block_meta();
+        if (block_meta == nullptr) {
+            LOGE("[Router] Failed to allocate block for 0x%llx", (unsigned long long)jump_addr);
+            return 0;  // 这会导致崩溃，但至少有日志
+        }
         Translator::scan(jump_addr, block_meta, type);
+        
+        // 验证翻译后的块
+        if (block_meta->block_start == nullptr || block_meta->block_size == 0) {
+            LOGE("[Router] Block translation failed for 0x%llx", (unsigned long long)jump_addr);
+        }
     }
 
-    return (uint64_t )block_meta->block_start;
+    return (uint64_t)block_meta->block_start;
 }
