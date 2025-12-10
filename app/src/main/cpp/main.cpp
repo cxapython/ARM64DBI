@@ -252,45 +252,29 @@ static uint64_t g_round10_key_addr = 0;
 static std::vector<uint64_t> g_key_access_pcs;
 static int g_total_eor_count = 0;
 
-// AES DFA 追踪回调 - 记录所有 EOR 指令和密钥内存访问
+// AES DFA 追踪 - 使用固定大小数组收集执行的 PC 地址
+static volatile int g_instruction_count_aes = 0;
+static const size_t MAX_TRACED_PCS = 10000;
+static uint64_t g_traced_pcs_arr[MAX_TRACED_PCS];
+static volatile size_t g_traced_pcs_count = 0;
+
 static void aes_dfa_callback(const CPU_CONTEXT* ctx) {
-    auto insn = DBI::disassemble(ctx->pc);
-    if (!insn) return;
+    // 增加计数器
+    g_instruction_count_aes++;
     
-    // 统计 EOR 指令（AES 的 AddRoundKey 操作）
-    if (insn->id == AARCH64_INS_EOR) {
-        g_total_eor_count++;
-    }
-    
-    // 检查是否访问第10轮密钥区域
-    if (insn->id == AARCH64_INS_LDR || insn->id == AARCH64_INS_LDRB) {
-        // 检查内存操作数
-        for (int i = 0; i < insn->detail->aarch64.op_count; i++) {
-            auto& op = insn->detail->aarch64.operands[i];
-            if (op.type == AARCH64_OP_MEM) {
-                // 获取基址寄存器的值
-                uint64_t base_val = 0;
-                int base_idx = op.mem.base - AARCH64_REG_X0;
-                if (base_idx >= 0 && base_idx < 29) {
-                    base_val = ctx->x[base_idx];
-                }
-                
-                uint64_t mem_addr = base_val + op.mem.disp;
-                
-                // 检查是否在第10轮密钥范围内
-                if (g_round10_key_addr > 0 && 
-                    mem_addr >= g_round10_key_addr && 
-                    mem_addr < g_round10_key_addr + 16) {
-                    g_key_access_pcs.push_back(ctx->pc);
-                }
-            }
-        }
+    // 收集 PC 到固定大小数组（不调用任何函数以保证执行正确性）
+    size_t idx = g_traced_pcs_count;
+    if (idx < MAX_TRACED_PCS) {
+        g_traced_pcs_arr[idx] = ctx->pc;
+        g_traced_pcs_count = idx + 1;
     }
 }
 
 // AES 加密包装函数
 static AESWhitebox* g_aes_instance = nullptr;
 
+// 注意：此函数在追踪时不能调用任何外部函数（如 LOGI），
+// 否则追踪器会尝试追踪外部库代码导致崩溃
 __attribute__((noinline))
 static void aes_encrypt_wrapper(const uint8_t* input, uint8_t* output) {
     if (g_aes_instance) {
@@ -354,8 +338,8 @@ void run_aes_dfa_full_demo() {
     LOGI("");
     
     // 3. 重置计数器
-    g_key_access_pcs.clear();
-    g_total_eor_count = 0;
+    g_instruction_count_aes = 0;
+    g_traced_pcs_count = 0;
     
     // 4. 先执行原始加密获取正确密文
     LOGI("▶ 执行原始 AES 加密...");
@@ -376,8 +360,16 @@ void run_aes_dfa_full_demo() {
         DBI::trace((uint64_t)aes_encrypt_wrapper, aes_dfa_callback);
     
     if (traced_encrypt) {
-        uint8_t ciphertext2[16];
+        uint8_t ciphertext2[16] = {0};
         traced_encrypt(plaintext, ciphertext2);
+        
+        // 打印追踪版本的密文
+        LOGI("▶ 追踪版本密文:");
+        LOGI("  %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+             ciphertext2[0], ciphertext2[1], ciphertext2[2], ciphertext2[3],
+             ciphertext2[4], ciphertext2[5], ciphertext2[6], ciphertext2[7],
+             ciphertext2[8], ciphertext2[9], ciphertext2[10], ciphertext2[11],
+             ciphertext2[12], ciphertext2[13], ciphertext2[14], ciphertext2[15]);
         
         // 验证追踪版本的正确性
         bool match = true;
@@ -395,29 +387,52 @@ void run_aes_dfa_full_demo() {
         LOGI("║                    DFA 攻击定位结果                           ║");
         LOGI("╚══════════════════════════════════════════════════════════════╝");
         LOGI("");
-        LOGI("▶ EOR 指令总数 (AddRoundKey操作): %d", g_total_eor_count);
-        LOGI("  说明: AES-128 有 11 轮 AddRoundKey，每轮 16 字节，共 176 次 EOR");
+        LOGI("▶ 追踪指令总数: %d", g_instruction_count_aes);
+        LOGI("▶ 收集的PC数量: %zu", g_traced_pcs_count);
+        LOGI("▶ 第10轮密钥地址: 0x%llx", (unsigned long long)g_round10_key_addr);
         LOGI("");
-        LOGI("▶ 第10轮密钥访问点: %zu 处", g_key_access_pcs.size());
         
-        if (!g_key_access_pcs.empty()) {
-            LOGI("  DFA 故障注入建议位置:");
-            for (size_t i = 0; i < g_key_access_pcs.size() && i < 5; i++) {
-                auto insn = DBI::disassemble(g_key_access_pcs[i]);
-                if (insn) {
-                    LOGI("    [%zu] PC=0x%llx: %s %s", 
-                         i, (unsigned long long)g_key_access_pcs[i],
-                         insn->mnemonic, insn->op_str);
-                }
+        // 后处理：分析收集的 PC 找出第10轮密钥访问点
+        int eor_count = 0;
+        std::vector<uint64_t> key_access_pcs;
+        
+        for (size_t i = 0; i < g_traced_pcs_count; i++) {
+            uint64_t pc = g_traced_pcs_arr[i];
+            auto insn = DBI::disassemble(pc);
+            if (!insn) continue;
+            
+            // 统计 EOR 指令
+            if (insn->id == AARCH64_INS_EOR) {
+                eor_count++;
             }
-            if (g_key_access_pcs.size() > 5) {
-                LOGI("    ... 还有 %zu 处", g_key_access_pcs.size() - 5);
+            
+            // 查找第10轮密钥访问
+            if (insn->id == AARCH64_INS_LDR || insn->id == AARCH64_INS_LDRB) {
+                // 检查是否可能访问第10轮密钥区域
+                // 注意：这里无法获取运行时寄存器值，只能通过 PC 地址范围推断
+                key_access_pcs.push_back(pc);
             }
+        }
+        
+        LOGI("▶ EOR 指令总数: %d", eor_count);
+        LOGI("  说明: AES-128 有 11 轮 AddRoundKey，每轮 16 字节");
+        LOGI("");
+        LOGI("▶ LDR/LDRB 指令位置 (前5个):");
+        for (size_t i = 0; i < key_access_pcs.size() && i < 5; i++) {
+            auto insn = DBI::disassemble(key_access_pcs[i]);
+            if (insn) {
+                LOGI("    [%zu] PC=0x%llx: %s %s", 
+                     i, (unsigned long long)key_access_pcs[i],
+                     insn->mnemonic, insn->op_str);
+            }
+        }
+        if (key_access_pcs.size() > 5) {
+            LOGI("    ... 共 %zu 处", key_access_pcs.size());
         }
         
         LOGI("");
         LOGI("▶ DFA 攻击指南:");
-        LOGI("  1. 在上述 PC 位置注入单字节故障");
+        LOGI("  1. 在第10轮密钥操作附近注入故障");
         LOGI("  2. 收集正确密文和故障密文");
         LOGI("  3. 使用差分分析恢复第10轮密钥");
         LOGI("  4. 逆推原始 AES 密钥");

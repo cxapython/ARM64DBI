@@ -191,10 +191,15 @@ void AESWhitebox::add_round_key(uint8_t* state, int round) {
 }
 
 // 加密单个块
+// 注意：不使用 memcpy 以避免追踪外部库函数
 __attribute__((noinline))
 void AESWhitebox::encrypt_block(const uint8_t* input, uint8_t* output) {
     uint8_t state[16];
-    memcpy(state, input, 16);
+    
+    // 内联复制输入（替代 memcpy）
+    for (int i = 0; i < 16; i++) {
+        state[i] = input[i];
+    }
     
     // 初始轮密钥加
     add_round_key(state, 0);
@@ -213,11 +218,16 @@ void AESWhitebox::encrypt_block(const uint8_t* input, uint8_t* output) {
     shift_rows(state);      // ShiftRows
     add_round_key(state, 10);  // ★★★ 第10轮密钥加 - DFA目标 ★★★
     
-    memcpy(output, state, 16);
+    // 内联复制输出（替代 memcpy）
+    for (int i = 0; i < 16; i++) {
+        output[i] = state[i];
+    }
 }
 
 void AESWhitebox::get_round10_key(uint8_t* key_out) const {
-    memcpy(key_out, round_keys[10], 16);
+    for (int i = 0; i < 16; i++) {
+        key_out[i] = round_keys[10][i];
+    }
 }
 
 void AESWhitebox::print_round_keys() const {
