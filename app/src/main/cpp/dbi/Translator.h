@@ -23,10 +23,18 @@ public:
     static void bl_ins_handle(uint32_t *&writer, uint64_t pc);
     // 翻译 BR 指令
     static void br_ins_handle(uint32_t *&writer, uint64_t pc);
+    // 翻译 BLR 指令 (间接函数调用)
+    static void blr_ins_handle(uint32_t *&writer, uint64_t pc);
     // 翻译 B.COND 指令
     static void b_cond_ins_handle(uint32_t *&writer, uint64_t pc);
+    // 翻译 CBZ/CBNZ 指令 (比较并分支)
+    static void cbz_ins_handle(uint32_t *&writer, uint64_t pc, bool is_cbnz);
+    // 翻译 TBZ/TBNZ 指令 (测试位并分支)
+    static void tbz_ins_handle(uint32_t *&writer, uint64_t pc, bool is_tbnz);
     // 翻译 ADRP 指令
     static void adrp_ins_handle(uint32_t *&writer, uint64_t pc);
+    // 翻译 ADR 指令
+    static void adr_ins_handle(uint32_t *&writer, uint64_t pc);
     // 翻译 RET 指令
     static void ret_ins_handle(uint32_t *&writer, uint64_t pc);
 };

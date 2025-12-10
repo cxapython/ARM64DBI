@@ -25,6 +25,8 @@ extern "C" {
 }
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "lidongyooodbi", __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "lidongyooodbi", __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "lidongyooodbi", __VA_ARGS__)
 #define PAGE_SIZE 4096
 #define ALIGN_PAGE_UP(x) (((x) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
 #define A64_INS_WIDTH 4

@@ -84,6 +84,8 @@ public:
 
     static ARM64_REGISTER get_br_reg(uint32_t machine_code);
 
+    static ARM64_REGISTER get_blr_reg(uint32_t machine_code);
+
     static bool b_is_cond(uint32_t machine_code);
 
     static void modify_b_cond_addr(uint32_t &instr, uint32_t machine_code, uint64_t current_pc, uint64_t new_address);
@@ -93,6 +95,22 @@ public:
     static void br_x16_jump(uint32_t *&writer, uint64_t target_addr);
 
     static void blr_x16_jump(uint32_t *&writer, uint64_t target_addr);
+
+    // CBZ/CBNZ 指令相关
+    static void get_cbz_addr(uint64_t &addr, uint64_t pc, uint32_t machine_code);
+    static ARM64_REGISTER get_cbz_reg(uint32_t machine_code);
+    static bool cbz_is_64bit(uint32_t machine_code);
+    static void cbz(uint32_t &instr, ARM64_REGISTER reg, uint64_t pc, uint64_t target, bool is_64bit, bool is_cbnz);
+
+    // TBZ/TBNZ 指令相关
+    static void get_tbz_addr(uint64_t &addr, uint64_t pc, uint32_t machine_code);
+    static ARM64_REGISTER get_tbz_reg(uint32_t machine_code);
+    static uint8_t get_tbz_bit(uint32_t machine_code);
+    static void tbz(uint32_t &instr, ARM64_REGISTER reg, uint8_t bit, uint64_t pc, uint64_t target, bool is_tbnz);
+
+    // ADR 指令相关
+    static void get_adr_addr(uint64_t &addr, uint64_t pc, uint32_t machine_code);
+    static ARM64_REGISTER get_adr_reg(uint32_t machine_code);
 };
 
 #define POINTER_SIZE 8

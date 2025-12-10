@@ -14,6 +14,18 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        
+        // 只编译 ARM64 架构
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+        
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-O2"
+                abiFilters += "arm64-v8a"
+            }
+        }
     }
 
     buildTypes {

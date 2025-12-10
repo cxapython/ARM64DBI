@@ -13,10 +13,7 @@
 #include <sstream>
 #include <iomanip>
 
-#define TAG "ARM64DBI-Taint"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+// 使用 types.h 中定义的日志宏
 
 // ==================== 辅助函数实现 ====================
 
@@ -508,8 +505,7 @@ void TaintAnalyzer::propagate(const CPU_CONTEXT* ctx) {
     // 根据指令类型处理污点传播
     switch (insn->id) {
         // ========== 数据移动指令 ==========
-        case AARCH64_INS_MOV:
-        case AARCH64_INS_MVN: {
+        case AARCH64_INS_MOV: {
             if (aarch64->op_count >= 2) {
                 cs_aarch64_op* dst = &aarch64->operands[0];
                 cs_aarch64_op* src = &aarch64->operands[1];
@@ -539,6 +535,159 @@ void TaintAnalyzer::propagate(const CPU_CONTEXT* ctx) {
                                  format_taint_tag(new_taint).c_str());
                         }
                     }
+                }
+            }
+            break;
+        }
+        
+        // ========== MOVZ/MOVK 指令 (立即数加载) ==========
+        case AARCH64_INS_MOVZ: {
+            // MOVZ 清除寄存器并写入立即数，清除污点
+            if (aarch64->op_count >= 1) {
+                cs_aarch64_op* dst = &aarch64->operands[0];
+                if (dst->type == AARCH64_OP_REG && auto_clear_on_const) {
+                    int dst_idx = cs_reg_to_idx(dst->reg);
+                    state.set_reg_taint(dst_idx, TAINT_NONE);
+                }
+            }
+            break;
+        }
+        
+        case AARCH64_INS_MOVK: {
+            // MOVK 保留其他位，部分覆盖，保留原有污点
+            // 不做任何操作，保持原有污点
+            break;
+        }
+        
+        // ========== 条件选择指令 (加密中常用) ==========
+        case AARCH64_INS_CSEL:
+        case AARCH64_INS_CSINC:
+        case AARCH64_INS_CSINV:
+        case AARCH64_INS_CSNEG: {
+            if (aarch64->op_count >= 2) {
+                cs_aarch64_op* dst = &aarch64->operands[0];
+                
+                if (dst->type == AARCH64_OP_REG) {
+                    int dst_idx = cs_reg_to_idx(dst->reg);
+                    TaintTag merged = TAINT_NONE;
+                    
+                    // 合并所有可能的源操作数污点
+                    for (int i = 1; i < aarch64->op_count; i++) {
+                        cs_aarch64_op* op = &aarch64->operands[i];
+                        if (op->type == AARCH64_OP_REG) {
+                            int src_idx = cs_reg_to_idx(op->reg);
+                            merged |= state.get_reg_taint(src_idx);
+                        }
+                    }
+                    
+                    state.set_reg_taint(dst_idx, merged);
+                    state.propagate_count++;
+                    
+                    if (state.verbose_mode && merged != TAINT_NONE) {
+                        LOGD("[CSEL] 0x%llx: %s %s -> %s = %s",
+                             (unsigned long long)ctx->pc,
+                             insn->mnemonic,
+                             insn->op_str,
+                             reg_idx_to_name(dst_idx),
+                             format_taint_tag(merged).c_str());
+                    }
+                }
+            }
+            break;
+        }
+        
+        // ========== 字节序反转指令 (加密常用) ==========
+        case AARCH64_INS_REV:
+        case AARCH64_INS_REV16:
+        case AARCH64_INS_REV32:
+        case AARCH64_INS_REV64:
+        case AARCH64_INS_RBIT: {
+            if (aarch64->op_count >= 2) {
+                cs_aarch64_op* dst = &aarch64->operands[0];
+                cs_aarch64_op* src = &aarch64->operands[1];
+                
+                if (dst->type == AARCH64_OP_REG && src->type == AARCH64_OP_REG) {
+                    int dst_idx = cs_reg_to_idx(dst->reg);
+                    int src_idx = cs_reg_to_idx(src->reg);
+                    TaintTag src_taint = state.get_reg_taint(src_idx);
+                    
+                    state.set_reg_taint(dst_idx, src_taint);
+                    state.propagate_count++;
+                    
+                    if (state.verbose_mode && src_taint != TAINT_NONE) {
+                        LOGD("[REV] 0x%llx: %s %s -> %s = %s",
+                             (unsigned long long)ctx->pc,
+                             insn->mnemonic,
+                             insn->op_str,
+                             reg_idx_to_name(dst_idx),
+                             format_taint_tag(src_taint).c_str());
+                    }
+                }
+            }
+            break;
+        }
+        
+        // ========== 位域操作指令 ==========
+        case AARCH64_INS_UBFM:
+        case AARCH64_INS_SBFM:
+        case AARCH64_INS_BFM:
+        case AARCH64_INS_EXTR: {
+            if (aarch64->op_count >= 2) {
+                cs_aarch64_op* dst = &aarch64->operands[0];
+                
+                if (dst->type == AARCH64_OP_REG) {
+                    int dst_idx = cs_reg_to_idx(dst->reg);
+                    TaintTag merged = TAINT_NONE;
+                    
+                    // 合并源操作数污点
+                    for (int i = 1; i < aarch64->op_count; i++) {
+                        cs_aarch64_op* op = &aarch64->operands[i];
+                        if (op->type == AARCH64_OP_REG) {
+                            int src_idx = cs_reg_to_idx(op->reg);
+                            merged |= state.get_reg_taint(src_idx);
+                        }
+                    }
+                    
+                    state.set_reg_taint(dst_idx, merged);
+                    state.propagate_count++;
+                }
+            }
+            break;
+        }
+        
+        // ========== 扩展指令 ==========
+        case AARCH64_INS_SXTB:
+        case AARCH64_INS_SXTH:
+        case AARCH64_INS_SXTW:
+        case AARCH64_INS_UXTB:
+        case AARCH64_INS_UXTH: {
+            if (aarch64->op_count >= 2) {
+                cs_aarch64_op* dst = &aarch64->operands[0];
+                cs_aarch64_op* src = &aarch64->operands[1];
+                
+                if (dst->type == AARCH64_OP_REG && src->type == AARCH64_OP_REG) {
+                    int dst_idx = cs_reg_to_idx(dst->reg);
+                    int src_idx = cs_reg_to_idx(src->reg);
+                    state.set_reg_taint(dst_idx, state.get_reg_taint(src_idx));
+                    state.propagate_count++;
+                }
+            }
+            break;
+        }
+        
+        // ========== 计数指令 ==========
+        case AARCH64_INS_CLZ:
+        case AARCH64_INS_CLS:
+        case AARCH64_INS_CNT: {
+            if (aarch64->op_count >= 2) {
+                cs_aarch64_op* dst = &aarch64->operands[0];
+                cs_aarch64_op* src = &aarch64->operands[1];
+                
+                if (dst->type == AARCH64_OP_REG && src->type == AARCH64_OP_REG) {
+                    int dst_idx = cs_reg_to_idx(dst->reg);
+                    int src_idx = cs_reg_to_idx(src->reg);
+                    state.set_reg_taint(dst_idx, state.get_reg_taint(src_idx));
+                    state.propagate_count++;
                 }
             }
             break;
@@ -657,7 +806,12 @@ void TaintAnalyzer::propagate(const CPU_CONTEXT* ctx) {
         case AARCH64_INS_LDRSB:
         case AARCH64_INS_LDRSH:
         case AARCH64_INS_LDRSW:
-        case AARCH64_INS_LDP: {
+        case AARCH64_INS_LDUR:
+        case AARCH64_INS_LDURB:
+        case AARCH64_INS_LDURH:
+        case AARCH64_INS_LDURSB:
+        case AARCH64_INS_LDURSH:
+        case AARCH64_INS_LDURSW: {
             if (!track_memory) break;
             
             if (aarch64->op_count >= 2) {
@@ -681,9 +835,15 @@ void TaintAnalyzer::propagate(const CPU_CONTEXT* ctx) {
                     
                     // 确定加载大小
                     size_t load_size = 8;  // 默认64位
-                    if (insn->id == AARCH64_INS_LDRB || insn->id == AARCH64_INS_LDRSB) load_size = 1;
-                    else if (insn->id == AARCH64_INS_LDRH || insn->id == AARCH64_INS_LDRSH) load_size = 2;
-                    else if (insn->id == AARCH64_INS_LDRSW) load_size = 4;
+                    if (insn->id == AARCH64_INS_LDRB || insn->id == AARCH64_INS_LDRSB ||
+                        insn->id == AARCH64_INS_LDURB || insn->id == AARCH64_INS_LDURSB) {
+                        load_size = 1;
+                    } else if (insn->id == AARCH64_INS_LDRH || insn->id == AARCH64_INS_LDRSH ||
+                               insn->id == AARCH64_INS_LDURH || insn->id == AARCH64_INS_LDURSH) {
+                        load_size = 2;
+                    } else if (insn->id == AARCH64_INS_LDRSW || insn->id == AARCH64_INS_LDURSW) {
+                        load_size = 4;
+                    }
                     
                     // 从内存获取污点
                     TaintTag mem_taint = state.get_mem_taint_range(mem_addr, load_size);
@@ -710,11 +870,80 @@ void TaintAnalyzer::propagate(const CPU_CONTEXT* ctx) {
             break;
         }
         
+        // ========== LDP 指令 (加载一对寄存器) ==========
+        case AARCH64_INS_LDP:
+        case AARCH64_INS_LDNP: {
+            if (!track_memory) break;
+            
+            if (aarch64->op_count >= 3) {
+                cs_aarch64_op* dst1 = &aarch64->operands[0];
+                cs_aarch64_op* dst2 = &aarch64->operands[1];
+                cs_aarch64_op* mem = &aarch64->operands[2];
+                
+                if (dst1->type == AARCH64_OP_REG && dst2->type == AARCH64_OP_REG && 
+                    mem->type == AARCH64_OP_MEM) {
+                    
+                    int dst1_idx = cs_reg_to_idx(dst1->reg);
+                    int dst2_idx = cs_reg_to_idx(dst2->reg);
+                    
+                    // 计算基址
+                    uint64_t mem_addr = 0;
+                    int base_idx = cs_reg_to_idx(mem->mem.base);
+                    if (base_idx >= 0 && base_idx < 29) {
+                        mem_addr = ctx->x[base_idx];
+                    } else if (base_idx == 29) {
+                        mem_addr = ctx->fp;
+                    } else if (base_idx == 31) {
+                        mem_addr = ctx->sp;
+                    }
+                    mem_addr += mem->mem.disp;
+                    
+                    // LDP 加载两个 64 位值
+                    size_t reg_size = 8;
+                    
+                    // 第一个寄存器的污点
+                    TaintTag mem_taint1 = state.get_mem_taint_range(mem_addr, reg_size);
+                    for (const auto& region : watch_regions) {
+                        if (mem_addr >= region.start && mem_addr < region.end) {
+                            mem_taint1 |= region.taint;
+                        }
+                    }
+                    state.set_reg_taint(dst1_idx, mem_taint1);
+                    
+                    // 第二个寄存器的污点
+                    TaintTag mem_taint2 = state.get_mem_taint_range(mem_addr + reg_size, reg_size);
+                    for (const auto& region : watch_regions) {
+                        uint64_t addr2 = mem_addr + reg_size;
+                        if (addr2 >= region.start && addr2 < region.end) {
+                            mem_taint2 |= region.taint;
+                        }
+                    }
+                    state.set_reg_taint(dst2_idx, mem_taint2);
+                    
+                    state.propagate_count += 2;
+                    
+                    if (state.verbose_mode && (mem_taint1 != TAINT_NONE || mem_taint2 != TAINT_NONE)) {
+                        LOGD("[LDP] 0x%llx: %s <- mem[0x%llx] = %s, %s <- mem[0x%llx] = %s",
+                             (unsigned long long)ctx->pc,
+                             reg_idx_to_name(dst1_idx),
+                             (unsigned long long)mem_addr,
+                             format_taint_tag(mem_taint1).c_str(),
+                             reg_idx_to_name(dst2_idx),
+                             (unsigned long long)(mem_addr + reg_size),
+                             format_taint_tag(mem_taint2).c_str());
+                    }
+                }
+            }
+            break;
+        }
+        
         // ========== 内存存储指令 ==========
         case AARCH64_INS_STR:
         case AARCH64_INS_STRB:
         case AARCH64_INS_STRH:
-        case AARCH64_INS_STP: {
+        case AARCH64_INS_STUR:
+        case AARCH64_INS_STURB:
+        case AARCH64_INS_STURH: {
             if (!track_memory) break;
             
             if (aarch64->op_count >= 2) {
@@ -739,8 +968,8 @@ void TaintAnalyzer::propagate(const CPU_CONTEXT* ctx) {
                     
                     // 确定存储大小
                     size_t store_size = 8;
-                    if (insn->id == AARCH64_INS_STRB) store_size = 1;
-                    else if (insn->id == AARCH64_INS_STRH) store_size = 2;
+                    if (insn->id == AARCH64_INS_STRB || insn->id == AARCH64_INS_STURB) store_size = 1;
+                    else if (insn->id == AARCH64_INS_STRH || insn->id == AARCH64_INS_STURH) store_size = 2;
                     
                     state.set_mem_taint(mem_addr, store_size, src_taint);
                     state.propagate_count++;
@@ -751,6 +980,58 @@ void TaintAnalyzer::propagate(const CPU_CONTEXT* ctx) {
                              (unsigned long long)mem_addr,
                              reg_idx_to_name(src_idx),
                              format_taint_tag(src_taint).c_str());
+                    }
+                }
+            }
+            break;
+        }
+        
+        // ========== STP 指令 (存储一对寄存器) ==========
+        case AARCH64_INS_STP:
+        case AARCH64_INS_STNP: {
+            if (!track_memory) break;
+            
+            if (aarch64->op_count >= 3) {
+                cs_aarch64_op* src1 = &aarch64->operands[0];
+                cs_aarch64_op* src2 = &aarch64->operands[1];
+                cs_aarch64_op* mem = &aarch64->operands[2];
+                
+                if (src1->type == AARCH64_OP_REG && src2->type == AARCH64_OP_REG &&
+                    mem->type == AARCH64_OP_MEM) {
+                    
+                    int src1_idx = cs_reg_to_idx(src1->reg);
+                    int src2_idx = cs_reg_to_idx(src2->reg);
+                    TaintTag src1_taint = state.get_reg_taint(src1_idx);
+                    TaintTag src2_taint = state.get_reg_taint(src2_idx);
+                    
+                    // 计算基址
+                    uint64_t mem_addr = 0;
+                    int base_idx = cs_reg_to_idx(mem->mem.base);
+                    if (base_idx >= 0 && base_idx < 29) {
+                        mem_addr = ctx->x[base_idx];
+                    } else if (base_idx == 29) {
+                        mem_addr = ctx->fp;
+                    } else if (base_idx == 31) {
+                        mem_addr = ctx->sp;
+                    }
+                    mem_addr += mem->mem.disp;
+                    
+                    size_t reg_size = 8;
+                    
+                    // 存储两个寄存器的污点
+                    state.set_mem_taint(mem_addr, reg_size, src1_taint);
+                    state.set_mem_taint(mem_addr + reg_size, reg_size, src2_taint);
+                    state.propagate_count += 2;
+                    
+                    if (state.verbose_mode && (src1_taint != TAINT_NONE || src2_taint != TAINT_NONE)) {
+                        LOGD("[STP] 0x%llx: mem[0x%llx] <- %s = %s, mem[0x%llx] <- %s = %s",
+                             (unsigned long long)ctx->pc,
+                             (unsigned long long)mem_addr,
+                             reg_idx_to_name(src1_idx),
+                             format_taint_tag(src1_taint).c_str(),
+                             (unsigned long long)(mem_addr + reg_size),
+                             reg_idx_to_name(src2_idx),
+                             format_taint_tag(src2_taint).c_str());
                     }
                 }
             }

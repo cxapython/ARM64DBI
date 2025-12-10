@@ -65,6 +65,9 @@ struct TaintFlow {
 // ==================== 污点状态管理 ====================
 
 class TaintState {
+    // 允许 TaintAnalyzer 访问私有成员
+    friend class TaintAnalyzer;
+    
 private:
     // 寄存器污点表 (X0-X30, SP)
     TaintTag reg_taint[32];

@@ -22,10 +22,28 @@ struct BlockMeta {
 class Memory {
 private:
     static Memory* instance;
+    size_t pool_size;
+    
     Memory() {
-        size_t blocks_meta_size = ALIGN_PAGE_UP(sizeof(BlockMeta) * BLOCK_NUMBER);
+        pool_size = ALIGN_PAGE_UP(sizeof(BlockMeta) * BLOCK_NUMBER);
         // 申请存放插桩代码的内存。使用预分配内存策略，提高效率。
-        first_block_meta = (BlockMeta*)mmap(nullptr, blocks_meta_size, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        first_block_meta = (BlockMeta*)mmap(nullptr, pool_size, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        
+        if (first_block_meta == MAP_FAILED) {
+            LOGE("Failed to allocate memory pool: %s", strerror(errno));
+            first_block_meta = nullptr;
+        } else {
+            LOGI("Memory pool allocated: %zu bytes at %p", pool_size, first_block_meta);
+            // 初始化内存池
+            memset(first_block_meta, 0, pool_size);
+        }
+    }
+    
+    ~Memory() {
+        if (first_block_meta != nullptr && first_block_meta != MAP_FAILED) {
+            munmap(first_block_meta, pool_size);
+            first_block_meta = nullptr;
+        }
     }
 
 public:
@@ -54,6 +72,11 @@ public:
     // 设置与获取已插桩的基本块，避免二次插桩同一基本块
     static bool set_cache_block_meta(uint64_t key, int value);
     static BlockMeta* get_cache_block_meta(uint64_t key);
+    
+    // 获取内存池使用状态
+    static int get_used_block_count();
+    static int get_available_block_count();
+    static bool is_initialized();
 };
 
 
