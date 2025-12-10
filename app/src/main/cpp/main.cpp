@@ -3,6 +3,7 @@
 #include "dbi/DBI.h"
 #include "dbi/Taint.h"
 #include "dbi/DataTracer.h"
+#include "dbi/TraceFile.h"
 
 // ============================================================================
 // ARM64DBI 综合测试文件
@@ -483,6 +484,62 @@ void run_data_trace_test() {
          hist_size, watch_count, (unsigned long long)timestamp);
 }
 
+// ==================== 测试7: Trace 文件生成 ====================
+
+// 测试: 生成 trace 文件用于算法还原
+void run_trace_file_test() {
+    LOGI("========================================");
+    LOGI("TEST 7: Trace File Generation");
+    LOGI("========================================");
+    
+    auto tf = TraceFile::getInstance();
+    
+    // 扫描已加载模块
+    tf->scan_modules();
+    tf->print_modules();
+    
+    // 配置
+    TraceConfig config;
+    config.output_path = "/data/local/tmp/quick_sort_trace";
+    config.output_text = true;
+    config.output_json = true;
+    config.record_regs = true;
+    config.record_memory = true;
+    config.record_opcodes = true;
+    config.max_records = 1000;  // 限制记录数
+    
+    tf->set_config(config);
+    
+    // 方式1: 直接指定函数地址
+    LOGI("Starting trace of quick_sort function...");
+    auto traced_sort = (void(*)(int[], int, int))tf->start_trace((uint64_t)quick_sort);
+    
+    if (traced_sort) {
+        int arr[] = {5, 3, 8, 1, 9};
+        traced_sort(arr, 0, 4);
+        
+        LOGI("Sorted: %d %d %d %d %d", arr[0], arr[1], arr[2], arr[3], arr[4]);
+    }
+    
+    // 保存 trace 文件
+    tf->save();
+    
+    // 导出不同格式
+    tf->export_unidbg_format("/data/local/tmp/quick_sort_unidbg.txt");
+    tf->export_ida_format("/data/local/tmp/quick_sort_ida.txt");
+    tf->export_summary("/data/local/tmp/quick_sort_summary.txt");
+    
+    // 分析结果
+    auto& records = tf->get_records();
+    LOGI("Total trace records: %zu", records.size());
+    
+    // 查找特定指令
+    auto eor_insns = tf->find_instructions("eor");
+    LOGI("Found %zu EOR instructions (crypto operations)", eor_insns.size());
+    
+    LOGI("Trace files saved to /data/local/tmp/");
+}
+
 // ==================== JNI 入口 ====================
 
 typedef int (*quick_sort_sign)(int arr[], int left, int right);
@@ -520,7 +577,10 @@ Java_com_lidongyooo_arm64dbidemo_MainActivity_stringFromJNI(
     // run_full_taint_flow_test();
     
     // 测试6: 数据溯源 (追踪值的来源)
-    run_data_trace_test();
+    // run_data_trace_test();
+    
+    // 测试7: Trace 文件生成 (用于算法还原)
+    run_trace_file_test();
     
     LOGI("============================================================");
     LOGI("All tests completed!");
