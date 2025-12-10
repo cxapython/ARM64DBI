@@ -79,7 +79,12 @@ void DataTracer::add_watch(int reg, uint64_t value, uint64_t mask, const char* n
     watch.value = value;
     watch.mask = mask;
     watch.name = name ? name : "";
+    watch.trigger_on_nth = 0;  // 每次都触发
+    watch.current_count = 0;
+    watch.pc_start = 0;
+    watch.pc_end = 0;
     watch.triggered = false;
+    watch.one_shot = false;
     watch.trigger_pc = 0;
     watch.trigger_timestamp = 0;
     watches.push_back(watch);
@@ -89,6 +94,83 @@ void DataTracer::add_watch(int reg, uint64_t value, uint64_t mask, const char* n
          (unsigned long long)value,
          (unsigned long long)mask,
          name ? name : "(unnamed)");
+}
+
+void DataTracer::add_watch_advanced(const ValueWatch& watch) {
+    watches.push_back(watch);
+    LOGI("[DataTracer] Added advanced watch: %s", watch.name.c_str());
+}
+
+void DataTracer::add_watch_with_condition(int reg, uint64_t value,
+                                          const std::vector<WatchCondition>& extra_conds,
+                                          const char* name) {
+    ValueWatch watch;
+    watch.reg = reg;
+    watch.value = value;
+    watch.mask = 0xFFFFFFFFFFFFFFFF;
+    watch.name = name ? name : "";
+    watch.extra_conditions = extra_conds;
+    watch.trigger_on_nth = 0;
+    watch.current_count = 0;
+    watches.push_back(watch);
+    
+    LOGI("[DataTracer] Added conditional watch: %s=%s with %zu extra conditions",
+         reg >= 0 ? reg_idx_to_name(reg) : "ANY",
+         name ? name : "(unnamed)",
+         extra_conds.size());
+}
+
+void DataTracer::add_watch_nth(int reg, uint64_t value, int nth, const char* name) {
+    ValueWatch watch;
+    watch.reg = reg;
+    watch.value = value;
+    watch.mask = 0xFFFFFFFFFFFFFFFF;
+    watch.name = name ? name : "";
+    watch.trigger_on_nth = nth;
+    watch.current_count = 0;
+    watch.one_shot = true;  // 第N次触发后停止
+    watches.push_back(watch);
+    
+    LOGI("[DataTracer] Added nth-trigger watch: %s=0x%llx on %d-th occurrence",
+         reg >= 0 ? reg_idx_to_name(reg) : "ANY",
+         (unsigned long long)value,
+         nth);
+}
+
+void DataTracer::add_watch_in_range(int reg, uint64_t value,
+                                     uint64_t pc_start, uint64_t pc_end,
+                                     const char* name) {
+    ValueWatch watch;
+    watch.reg = reg;
+    watch.value = value;
+    watch.mask = 0xFFFFFFFFFFFFFFFF;
+    watch.name = name ? name : "";
+    watch.pc_start = pc_start;
+    watch.pc_end = pc_end;
+    watches.push_back(watch);
+    
+    LOGI("[DataTracer] Added range-limited watch: %s=0x%llx in [0x%llx-0x%llx]",
+         reg >= 0 ? reg_idx_to_name(reg) : "ANY",
+         (unsigned long long)value,
+         (unsigned long long)pc_start,
+         (unsigned long long)pc_end);
+}
+
+void DataTracer::add_watch_after_insn(int reg, uint64_t value,
+                                       const char* mnemonic,
+                                       const char* name) {
+    ValueWatch watch;
+    watch.reg = reg;
+    watch.value = value;
+    watch.mask = 0xFFFFFFFFFFFFFFFF;
+    watch.name = name ? name : "";
+    watch.mnemonic_filter = mnemonic;
+    watches.push_back(watch);
+    
+    LOGI("[DataTracer] Added instruction-filtered watch: %s=0x%llx after '%s'",
+         reg >= 0 ? reg_idx_to_name(reg) : "ANY",
+         (unsigned long long)value,
+         mnemonic);
 }
 
 void DataTracer::remove_watch(int reg, uint64_t value) {
@@ -280,59 +362,118 @@ void DataTracer::record(const CPU_CONTEXT* ctx) {
     has_last_regs = true;
     
     // 检查值监控点
-    for (auto& watch : watches) {
-        if (watch.triggered) continue;
+    std::vector<size_t> to_remove;  // 需要移除的一次性监控
+    
+    for (size_t wi = 0; wi < watches.size(); wi++) {
+        auto& watch = watches[wi];
+        if (watch.triggered && watch.one_shot) continue;
         
-        bool match = false;
+        // ===== 检查主条件 =====
+        bool main_match = false;
         int matched_reg = -1;
         
         if (watch.reg >= 0) {
-            // 监控特定寄存器
             uint64_t reg_val = record.regs_before[watch.reg];
             if ((reg_val & watch.mask) == (watch.value & watch.mask)) {
-                match = true;
+                main_match = true;
                 matched_reg = watch.reg;
             }
         } else {
-            // 监控任意寄存器
             for (int i = 0; i < 32; i++) {
                 uint64_t reg_val = record.regs_before[i];
                 if ((reg_val & watch.mask) == (watch.value & watch.mask)) {
-                    match = true;
+                    main_match = true;
                     matched_reg = i;
                     break;
                 }
             }
         }
         
-        if (match) {
-            watch.triggered = true;
-            watch.trigger_pc = ctx->pc;
-            watch.trigger_timestamp = record.timestamp;
-            
-            LOGI("========== VALUE WATCH TRIGGERED ==========");
-            LOGI("Watch: %s", watch.name.c_str());
-            LOGI("PC: 0x%llx", (unsigned long long)ctx->pc);
-            LOGI("Register: %s = 0x%llx", 
-                 reg_idx_to_name(matched_reg),
-                 (unsigned long long)record.regs_before[matched_reg]);
-            LOGI("Instruction: %s %s", insn->mnemonic, insn->op_str);
-            
-            // 自动追溯
-            if (auto_trace_on_watch) {
-                LOGI("--- Tracing source ---");
-                auto source = trace_register(matched_reg, watch.value, record.timestamp);
-                print_source(source);
-            }
-            
-            LOGI("===========================================");
-            
-            // 调用用户回调
-            if (source_callback) {
-                auto source = trace_register(matched_reg, watch.value, record.timestamp);
-                source_callback(source, callback_user_data);
+        if (!main_match) continue;
+        
+        // ===== 检查额外条件 (AND 关系) =====
+        bool extra_match = true;
+        for (const auto& cond : watch.extra_conditions) {
+            if (cond.reg >= 0 && cond.reg < 32) {
+                uint64_t reg_val = record.regs_before[cond.reg];
+                if ((reg_val & cond.mask) != (cond.value & cond.mask)) {
+                    extra_match = false;
+                    break;
+                }
             }
         }
+        if (!extra_match) continue;
+        
+        // ===== 检查地址范围 =====
+        if (watch.pc_start > 0 || watch.pc_end > 0) {
+            if (ctx->pc < watch.pc_start || ctx->pc >= watch.pc_end) {
+                continue;
+            }
+        }
+        
+        // ===== 检查指令过滤 =====
+        if (!watch.mnemonic_filter.empty()) {
+            if (watch.mnemonic_filter != insn->mnemonic) {
+                continue;
+            }
+        }
+        
+        // ===== 检查第N次触发 =====
+        watch.current_count++;
+        if (watch.trigger_on_nth > 0 && watch.current_count != watch.trigger_on_nth) {
+            continue;  // 不是第N次，跳过
+        }
+        
+        // ===== 所有条件满足，触发! =====
+        watch.triggered = true;
+        watch.trigger_pc = ctx->pc;
+        watch.trigger_timestamp = record.timestamp;
+        
+        LOGI("========== VALUE WATCH TRIGGERED ==========");
+        LOGI("Watch: %s", watch.name.c_str());
+        LOGI("PC: 0x%llx", (unsigned long long)ctx->pc);
+        LOGI("Occurrence: #%d", watch.current_count);
+        LOGI("Register: %s = 0x%llx", 
+             reg_idx_to_name(matched_reg),
+             (unsigned long long)record.regs_before[matched_reg]);
+        LOGI("Instruction: %s %s", insn->mnemonic, insn->op_str);
+        
+        // 打印上下文 (前后5条指令)
+        LOGI("--- Context (nearby instructions) ---");
+        size_t start_idx = history.size() > 5 ? history.size() - 5 : 0;
+        for (size_t i = start_idx; i < history.size(); i++) {
+            const auto& h = history[i];
+            LOGI("  [%llu] 0x%llx: %s %s", 
+                 (unsigned long long)h.timestamp,
+                 (unsigned long long)h.pc,
+                 h.mnemonic.c_str(),
+                 h.op_str.c_str());
+        }
+        
+        // 自动追溯
+        if (auto_trace_on_watch) {
+            LOGI("--- Tracing source ---");
+            auto source = trace_register(matched_reg, watch.value, record.timestamp);
+            print_source(source);
+        }
+        
+        LOGI("===========================================");
+        
+        // 调用用户回调
+        if (source_callback) {
+            auto source = trace_register(matched_reg, watch.value, record.timestamp);
+            source_callback(source, callback_user_data);
+        }
+        
+        // 标记需要移除的一次性监控
+        if (watch.one_shot) {
+            to_remove.push_back(wi);
+        }
+    }
+    
+    // 移除已触发的一次性监控 (从后往前删除)
+    for (auto it = to_remove.rbegin(); it != to_remove.rend(); ++it) {
+        watches.erase(watches.begin() + *it);
     }
 }
 

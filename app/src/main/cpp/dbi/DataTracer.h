@@ -75,16 +75,51 @@ struct DataSource {
     std::vector<DataSource> parents;
 };
 
-// ==================== 值监控点 ====================
+// ==================== 值监控点 (高级版) ====================
+
+// 监控条件
+struct WatchCondition {
+    int reg;                        // 寄存器索引 (-1 = 不检查)
+    uint64_t value;                 // 期望值
+    uint64_t mask;                  // 掩码
+    
+    WatchCondition() : reg(-1), value(0), mask(0xFFFFFFFFFFFFFFFF) {}
+    WatchCondition(int r, uint64_t v, uint64_t m = 0xFFFFFFFFFFFFFFFF) 
+        : reg(r), value(v), mask(m) {}
+};
 
 struct ValueWatch {
-    int reg;                        // 监控的寄存器 (-1 表示任意)
+    // 基本条件
+    int reg;                        // 主监控寄存器 (-1 表示任意)
     uint64_t value;                 // 监控的值
-    uint64_t mask;                  // 掩码 (0xFFFFFFFFFFFFFFFF 表示精确匹配)
+    uint64_t mask;                  // 掩码
     std::string name;               // 监控点名称
+    
+    // 高级条件 - 组合条件
+    std::vector<WatchCondition> extra_conditions;  // 额外条件 (AND 关系)
+    
+    // 高级条件 - 触发控制
+    int trigger_on_nth;             // 第N次出现时触发 (0=每次, 1=第1次, 2=第2次...)
+    int current_count;              // 当前已出现次数
+    
+    // 高级条件 - 地址范围
+    uint64_t pc_start;              // 限制 PC 范围起始 (0=不限制)
+    uint64_t pc_end;                // 限制 PC 范围结束
+    
+    // 高级条件 - 指令过滤
+    std::string mnemonic_filter;    // 只在特定指令触发 (如 "eor", "add")
+    
+    // 状态
     bool triggered;                 // 是否已触发
+    bool one_shot;                  // 触发一次后自动移除
     uint64_t trigger_pc;            // 触发时的 PC
     uint64_t trigger_timestamp;     // 触发时的时间戳
+    
+    ValueWatch() : reg(-1), value(0), mask(0xFFFFFFFFFFFFFFFF),
+                   trigger_on_nth(0), current_count(0),
+                   pc_start(0), pc_end(0),
+                   triggered(false), one_shot(false),
+                   trigger_pc(0), trigger_timestamp(0) {}
 };
 
 // ==================== 数据追踪器 ====================
@@ -140,12 +175,9 @@ public:
     // 设置追溯回调
     void set_source_callback(DataSourceCallback callback, void* user_data);
     
-    // ==================== 值监控 ====================
+    // ==================== 值监控 (基础) ====================
     
-    // 添加值监控点
-    // reg: 寄存器索引 (0-30, 31=SP, -1=任意寄存器)
-    // value: 要监控的值
-    // mask: 掩码，用于部分匹配 (如只匹配低8位: mask=0xFF)
+    // 添加简单值监控点
     void add_watch(int reg, uint64_t value, uint64_t mask = 0xFFFFFFFFFFFFFFFF, 
                    const char* name = nullptr);
     
@@ -154,6 +186,33 @@ public:
     
     // 清除所有监控点
     void clear_watches();
+    
+    // ==================== 值监控 (高级) ====================
+    
+    // 添加高级监控点 (完整配置)
+    void add_watch_advanced(const ValueWatch& watch);
+    
+    // 添加带组合条件的监控
+    // 例: 当 X0=0xE5 且 X1=0x123 时触发
+    void add_watch_with_condition(int reg, uint64_t value, 
+                                  const std::vector<WatchCondition>& extra_conds,
+                                  const char* name = nullptr);
+    
+    // 添加第N次出现时触发的监控
+    // 例: 第3次 X0=0xE5 时才触发
+    void add_watch_nth(int reg, uint64_t value, int nth, const char* name = nullptr);
+    
+    // 添加限定地址范围的监控
+    // 例: 只在 0x1000-0x2000 范围内监控 X0=0xE5
+    void add_watch_in_range(int reg, uint64_t value, 
+                            uint64_t pc_start, uint64_t pc_end,
+                            const char* name = nullptr);
+    
+    // 添加限定指令类型的监控
+    // 例: 只在 EOR 指令后 X0=0xE5 时触发 (用于找加密关键步骤)
+    void add_watch_after_insn(int reg, uint64_t value, 
+                              const char* mnemonic,
+                              const char* name = nullptr);
     
     // ==================== 追踪控制 ====================
     
