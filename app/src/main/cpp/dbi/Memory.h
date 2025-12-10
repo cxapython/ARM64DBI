@@ -6,8 +6,8 @@
 #define ARM64DBIDEMO_MEMORY_H
 #include "../types/types.h"
 
-#define BLOCK_NUMBER 4096
-#define BLOCK_SIZE 1024
+#define BLOCK_NUMBER 512   // 块数量（内存 = BLOCK_NUMBER * BLOCK_SIZE * 4 字节）
+#define BLOCK_SIZE 4096    // 每个块的指令数（16KB per block）
 
 struct BlockMeta {
     int index;

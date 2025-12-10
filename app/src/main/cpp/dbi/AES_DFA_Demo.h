@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <vector>
 #include <string>
+#include "DBI.h"
+#include "Taint.h"
 
 // ==================== DFA攻击点信息 ====================
 

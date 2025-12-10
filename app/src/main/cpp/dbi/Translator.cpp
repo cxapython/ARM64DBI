@@ -134,10 +134,12 @@ void Translator::scan(uint64_t target_addr, BlockMeta* block_meta, ROUTER_TYPE t
 
     // ===== 遍历并翻译指令 =====
     int offset = 0;
-    // 安全限制：防止无限循环导致块溢出
-    const int max_instructions = BLOCK_SIZE / 10;
+    // 安全限制：防止块溢出
+    // 每条指令翻译后可能扩展到 60+ 条（含 prolog/epilog），预留 500 条空间
+    const int max_code_size = BLOCK_SIZE - 500;  // 预留结束跳转和安全边界
+    auto code_start = dbi_code;
 
-    while (offset / A64_INS_WIDTH < max_instructions) {
+    while ((dbi_code - code_start) < max_code_size) {
         uint64_t pc = target_addr + offset;
         
         // 使用 cs_disasm_iter 进行反汇编（比 cs_disasm 更高效）
@@ -216,7 +218,20 @@ void Translator::scan(uint64_t target_addr, BlockMeta* block_meta, ROUTER_TYPE t
         offset += A64_INS_WIDTH;
     }
 
-    LOGE("[Translator] Warning: Block reached max instruction limit (%d)", max_instructions);
+    // 达到块限制时，生成跳转代码让 Router 继续翻译后续指令
+    LOGI("[Translator] Block reached code size limit (%d/%d), continuing with next block", 
+         (int)(dbi_code - code_start), max_code_size);
+    
+    // 计算下一条未翻译指令的地址
+    uint64_t next_pc = target_addr + offset;
+    
+    // 生成跳转到 Router 的代码（类似 B 指令处理）
+    Router::push_register(dbi_code);
+    Assembler::write_value_to_reg(dbi_code, REG_X1, B_ROUTER_TYPE);
+    Assembler::write_value_to_reg(dbi_code, REG_X0, next_pc);
+    Assembler::br_x16_jump(dbi_code, (uint64_t)router);
+    
+    return block_ending(type, block_meta, (uint8_t*)dbi_code, target_addr, next_pc - A64_INS_WIDTH);
 }
 
 // ==================== 指令翻译处理函数 ====================
