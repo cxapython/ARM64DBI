@@ -2,6 +2,7 @@
 #include <string>
 #include "dbi/DBI.h"
 #include "dbi/Taint.h"
+#include "dbi/DataTracer.h"
 
 // ============================================================================
 // ARM64DBI 综合测试文件
@@ -409,6 +410,79 @@ void run_full_taint_flow_test() {
     analyzer->get_state()->dump_flow_graph();
 }
 
+// ==================== 测试6: 数据溯源示例 ====================
+
+// 简单的数据变换函数 (用于演示数据溯源)
+__attribute__((noinline))
+uint64_t transform_data(uint64_t input) {
+    uint64_t a = input ^ 0x5A5A5A5A;     // XOR 操作
+    uint64_t b = a + 0x12345678;          // 加法操作
+    uint64_t c = (b << 8) | (b >> 56);    // 位旋转
+    uint64_t d = c & 0xFF00FF00FF00FF00;  // 掩码操作
+    return d;
+}
+
+void transform_end(){}
+
+// 当监控值被触发时的回调
+void on_value_found(const DataSource& source, void* user_data) {
+    LOGI(">>> User callback: Found value source!");
+    LOGI(">>> Type: %s", source_type_name(source.type));
+    LOGI(">>> PC: 0x%llx", (unsigned long long)source.pc);
+    LOGI(">>> Instruction: %s", source.instruction.c_str());
+}
+
+// 测试6: 数据溯源功能
+void run_data_trace_test() {
+    LOGI("========================================");
+    LOGI("TEST 6: Data Source Tracing");
+    LOGI("========================================");
+    
+    auto tracer = DataTracer::getInstance();
+    tracer->reset();
+    
+    // 设置回调
+    tracer->set_source_callback(on_value_found, nullptr);
+    
+    // 添加值监控点
+    // 假设我们想知道 0xE5 这个值是怎么产生的
+    // 这里我们监控一个变换后的特定值
+    uint64_t test_input = 0x12345678;
+    uint64_t expected_output = transform_data(test_input);
+    
+    LOGI("Input: 0x%llx", (unsigned long long)test_input);
+    LOGI("Expected output: 0x%llx", (unsigned long long)expected_output);
+    LOGI("Adding watch for output value...");
+    
+    // 监控 X0 寄存器中出现 expected_output 值
+    tracer->add_watch(0, expected_output, 0xFFFFFFFFFFFFFFFF, "transform_result");
+    
+    // 开始追踪
+    auto traced_func = (uint64_t(*)(uint64_t))tracer->trace((uint64_t)transform_data);
+    
+    if (traced_func) {
+        uint64_t result = traced_func(test_input);
+        LOGI("Actual result: 0x%llx", (unsigned long long)result);
+        
+        // 手动追溯 X0 的来源
+        LOGI("--- Manual trace of X0 ---");
+        auto source = tracer->trace_register(0);  // 追溯 X0
+        tracer->print_source(source);
+        
+        // 获取完整追溯链
+        LOGI("--- Full trace chain ---");
+        auto chain = tracer->get_full_trace(0, 0, 10);
+        tracer->print_trace_chain(chain);
+    }
+    
+    // 打印统计
+    size_t hist_size, watch_count;
+    uint64_t timestamp;
+    tracer->get_stats(&hist_size, &watch_count, &timestamp);
+    LOGI("Statistics: history=%zu, watches=%zu, instructions=%llu",
+         hist_size, watch_count, (unsigned long long)timestamp);
+}
+
 // ==================== JNI 入口 ====================
 
 typedef int (*quick_sort_sign)(int arr[], int left, int right);
@@ -440,10 +514,13 @@ Java_com_lidongyooo_arm64dbidemo_MainActivity_stringFromJNI(
     // run_branch_test();
     
     // 测试4: 污点分析
-    run_taint_test();
+    // run_taint_test();
     
     // 测试5: 完整污点流
     // run_full_taint_flow_test();
+    
+    // 测试6: 数据溯源 (追踪值的来源)
+    run_data_trace_test();
     
     LOGI("============================================================");
     LOGI("All tests completed!");
