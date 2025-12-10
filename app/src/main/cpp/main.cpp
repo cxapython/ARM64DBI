@@ -4,6 +4,8 @@
 #include "dbi/Taint.h"
 #include "dbi/DataTracer.h"
 #include "dbi/TraceFile.h"
+#include "dbi/AESWhitebox.h"
+#include "dbi/AES_DFA_Demo.h"
 
 // ============================================================================
 // ARM64DBI 综合测试文件
@@ -484,6 +486,158 @@ void run_data_trace_test() {
          hist_size, watch_count, (unsigned long long)timestamp);
 }
 
+// ==================== 测试8: AES白盒DFA攻击定位 ====================
+
+// 全局变量用于追踪
+static AESWhitebox* g_aes = nullptr;
+static int g_eor_count = 0;
+static std::vector<std::pair<uint64_t, uint8_t>> g_round10_eors;
+
+// 包装函数，用于绕过成员函数指针限制
+__attribute__((noinline))
+void aes_encrypt_wrapper(const uint8_t* input, uint8_t* output) {
+    g_aes->encrypt_block(input, output);
+}
+void aes_encrypt_wrapper_end(){}
+
+// AES追踪回调
+void aes_trace_callback(const CPU_CONTEXT* ctx) {
+    auto insn = DBI::disassemble(ctx->pc);
+    if (!insn) return;
+    
+    // 检测EOR指令 - 这是AddRoundKey的核心操作
+    if (strcmp(insn->mnemonic, "eor") == 0) {
+        g_eor_count++;
+        
+        // AES有大量EOR操作，我们需要定位第10轮的
+        // 第10轮AddRoundKey在最后16个EOR操作中
+        // 每轮AddRoundKey有16个EOR（每字节一个）
+        // 总共11轮 * 16 = 176个EOR（不含S-box中的EOR）
+        
+        // 简化处理：记录所有EOR，后面分析
+        // 获取EOR的结果（通常在目标寄存器）
+        if (insn->detail && insn->detail->aarch64.op_count >= 1) {
+            auto op = insn->detail->aarch64.operands[0];
+            if (op.type == AARCH64_OP_REG) {
+                int reg_idx = cs_reg_to_idx(op.reg);
+                if (reg_idx >= 0 && reg_idx < 29) {
+                    uint64_t value = ctx->x[reg_idx];
+                    g_round10_eors.push_back({ctx->pc, (uint8_t)(value & 0xFF)});
+                }
+            }
+        }
+    }
+}
+
+// 测试AES DFA攻击
+void run_aes_dfa_test() {
+    LOGI("========================================");
+    LOGI("TEST 8: AES Whitebox DFA Attack Demo");
+    LOGI("========================================");
+    
+    // 创建AES实例
+    g_aes = new AESWhitebox();
+    
+    // 设置测试密钥
+    uint8_t key[16] = {
+        0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+        0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+    };
+    g_aes->set_key(key);
+    
+    // 打印所有轮密钥（包括第10轮）
+    g_aes->print_round_keys();
+    
+    // 获取并显示第10轮密钥（这是我们要通过DFA恢复的目标）
+    uint8_t round10_key[16];
+    g_aes->get_round10_key(round10_key);
+    LOGI("Target: Round 10 Key to recover:");
+    LOGI("  %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+         round10_key[0], round10_key[1], round10_key[2], round10_key[3],
+         round10_key[4], round10_key[5], round10_key[6], round10_key[7],
+         round10_key[8], round10_key[9], round10_key[10], round10_key[11],
+         round10_key[12], round10_key[13], round10_key[14], round10_key[15]);
+    
+    // 测试明文
+    uint8_t plaintext[16] = {
+        0x32, 0x43, 0xF6, 0xA8, 0x88, 0x5A, 0x30, 0x8D,
+        0x31, 0x31, 0x98, 0xA2, 0xE0, 0x37, 0x07, 0x34
+    };
+    uint8_t ciphertext[16];
+    
+    LOGI("Plaintext: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+         plaintext[0], plaintext[1], plaintext[2], plaintext[3],
+         plaintext[4], plaintext[5], plaintext[6], plaintext[7],
+         plaintext[8], plaintext[9], plaintext[10], plaintext[11],
+         plaintext[12], plaintext[13], plaintext[14], plaintext[15]);
+    
+    // 重置追踪状态
+    g_eor_count = 0;
+    g_round10_eors.clear();
+    
+    // 使用DataTracer追踪加密过程
+    auto tracer = DataTracer::getInstance();
+    tracer->reset();
+    
+    // 设置在EOR指令后监控特定寄存器值
+    // 这有助于定位第10轮的AddRoundKey操作
+    
+    LOGI("Starting AES encryption trace...");
+    LOGI("Looking for Round 10 AddRoundKey (last 16 EOR operations before output)");
+    
+    // 使用包装函数进行追踪
+    uint64_t encrypt_addr = (uint64_t)aes_encrypt_wrapper;
+    
+    LOGI("AES encrypt wrapper at: 0x%llx", (unsigned long long)encrypt_addr);
+    
+    // 开始追踪
+    auto traced_encrypt = (void(*)(const uint8_t*, uint8_t*))
+        DBI::trace(encrypt_addr, aes_trace_callback);
+    
+    if (traced_encrypt) {
+        // 执行加密
+        traced_encrypt(plaintext, ciphertext);
+        
+        LOGI("Ciphertext: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+             ciphertext[0], ciphertext[1], ciphertext[2], ciphertext[3],
+             ciphertext[4], ciphertext[5], ciphertext[6], ciphertext[7],
+             ciphertext[8], ciphertext[9], ciphertext[10], ciphertext[11],
+             ciphertext[12], ciphertext[13], ciphertext[14], ciphertext[15]);
+        
+        LOGI("Total EOR instructions found: %d", g_eor_count);
+        
+        // 分析第10轮的EOR操作
+        // 第10轮AddRoundKey是最后16个与密钥相关的EOR
+        LOGI("========================================");
+        LOGI("DFA Attack Points (Round 10 AddRoundKey):");
+        LOGI("========================================");
+        
+        // 取最后的EOR操作（对应第10轮）
+        size_t start_idx = g_round10_eors.size() > 16 ? g_round10_eors.size() - 16 : 0;
+        for (size_t i = start_idx; i < g_round10_eors.size(); i++) {
+            auto& eor = g_round10_eors[i];
+            LOGI("  [%zu] PC=0x%llx, Result=0x%02X",
+                 i - start_idx,
+                 (unsigned long long)eor.first,
+                 eor.second);
+        }
+        
+        LOGI("");
+        LOGI("★ DFA Attack Strategy:");
+        LOGI("  1. Inject fault at MixColumns output (Round 9)");
+        LOGI("  2. Compare faulty and correct ciphertexts");
+        LOGI("  3. Use differential analysis to recover Round 10 key");
+        LOGI("  4. Invert key schedule to get original key");
+        LOGI("");
+        LOGI("★ Round 10 Key address: 0x%llx", 
+             (unsigned long long)g_aes->get_round10_key_addr());
+        LOGI("========================================");
+    }
+    
+    delete g_aes;
+    g_aes = nullptr;
+}
+
 // ==================== 测试7: Trace 文件生成 ====================
 
 // 测试: 生成 trace 文件用于算法还原
@@ -580,7 +734,24 @@ Java_com_lidongyooo_arm64dbidemo_MainActivity_stringFromJNI(
     // run_data_trace_test();
     
     // 测试7: Trace 文件生成 (用于算法还原)
-    run_trace_file_test();
+    // run_trace_file_test();
+    
+    // 测试8: AES白盒DFA攻击定位 (旧版本)
+    // run_aes_dfa_test();
+    
+    // 测试9: AES白盒DFA攻击定位 (新版本 - 使用数据溯源)
+    LOGI("============================================================");
+    LOGI("Running AES DFA Demo with Data Tracing...");
+    LOGI("============================================================");
+    run_aes_dfa_demo();
+    
+    // 测试10: 验证DFA定位结果
+    LOGI("");
+    LOGI("============================================================");
+    LOGI("Running AES DFA Verification...");
+    LOGI("============================================================");
+    bool dfa_result = run_aes_dfa_verified_demo();
+    LOGI("DFA Verification Result: %s", dfa_result ? "PASSED" : "FAILED");
     
     LOGI("============================================================");
     LOGI("All tests completed!");

@@ -642,10 +642,204 @@ analyzer->set_track_memory(true);      // 内存操作
 
 ---
 
+## 实战案例：AES白盒DFA攻击定位
+
+### 案例背景
+
+DFA（Differential Fault Analysis，差分故障分析）攻击是一种针对AES加密的侧信道攻击方法。攻击者需要在AES第9轮MixColumns之后注入故障，然后通过分析正确密文和错误密文的差异来恢复第10轮密钥。
+
+**关键挑战**：在白盒AES实现中，如何精确定位第10轮密钥的使用位置？
+
+### 解决方案
+
+使用ARM64DBI的数据溯源和污点分析功能，可以精确定位第10轮密钥：
+
+#### 方法1：使用污点分析追踪密钥传播
+
+```cpp
+#include "dbi/Taint.h"
+#include "dbi/AESWhitebox.h"
+#include "dbi/AES_DFA_Demo.h"
+
+void locate_round10_key_with_taint() {
+    AESWhitebox aes;
+    uint8_t key[16] = {0x2B, 0x7E, 0x15, 0x16, ...};
+    aes.set_key(key);
+    
+    // 获取污点分析器
+    auto* analyzer = TaintAnalyzer::getInstance();
+    analyzer->reset();
+    analyzer->get_state()->set_verbose(true);
+    
+    // ★ 关键：标记第10轮密钥为污点源
+    analyzer->mark_mem_source(aes.get_round10_key_addr(), 16, TAINT_USER1);
+    
+    // 设置回调，检测带有第10轮密钥污点的XOR操作
+    analyzer->set_user_callback([](const CPU_CONTEXT* ctx, TaintState* state) {
+        auto insn = DBI::disassemble(ctx->pc);
+        if (!insn) return;
+        
+        // 检测EOR指令（AddRoundKey的核心操作）
+        if (insn->id == AARCH64_INS_EOR) {
+            for (int i = 0; i < 32; i++) {
+                if (state->get_reg_taint(i) & TAINT_USER1) {
+                    LOGI("★ Round 10 AddRoundKey detected!");
+                    LOGI("   PC: 0x%llx", ctx->pc);
+                    LOGI("   Instruction: %s %s", insn->mnemonic, insn->op_str);
+                    LOGI("   Register: %s = 0x%llx", 
+                         reg_idx_to_name(i), ctx->x[i]);
+                }
+            }
+        }
+    });
+    
+    // 开始追踪
+    uint8_t plaintext[16] = {...};
+    uint8_t ciphertext[16];
+    
+    auto traced = (void(*)(const uint8_t*, uint8_t*))
+        analyzer->trace((uint64_t)&aes_encrypt_wrapper);
+    traced(plaintext, ciphertext);
+    
+    analyzer->print_summary();
+}
+```
+
+#### 方法2：使用数据溯源定位密钥读取
+
+```cpp
+#include "dbi/DataTracer.h"
+#include "dbi/AES_DFA_Demo.h"
+
+void locate_round10_key_with_tracer() {
+    AESWhitebox aes;
+    aes.set_key(key);
+    
+    // 获取第10轮密钥（用于验证）
+    uint8_t round10_key[16];
+    aes.get_round10_key(round10_key);
+    
+    auto* dfa = AESDFADemo::getInstance();
+    dfa->reset();
+    
+    // 设置密钥区域监控
+    dfa->set_key_region(aes.get_round10_key_addr() - 160, 176);  // 所有轮密钥
+    dfa->set_round10_key_addr(aes.get_round10_key_addr());
+    
+    // 开始追踪
+    auto traced = (void(*)(const uint8_t*, uint8_t*))
+        dfa->start_trace((uint64_t)&aes_encrypt_wrapper);
+    
+    uint8_t pt[16] = {...};
+    uint8_t ct[16];
+    traced(pt, ct);
+    
+    // 分析并打印报告
+    auto report = dfa->analyze();
+    dfa->print_report(report);
+    
+    // 打印DFA攻击指南
+    dfa->print_attack_guide();
+}
+```
+
+### 完整演示
+
+运行完整的DFA攻击定位演示：
+
+```cpp
+// 方法1：完整演示（包含污点分析和数据溯源）
+run_aes_dfa_demo();
+
+// 方法2：简化演示（仅显示密钥位置）
+run_aes_dfa_simple_demo();
+
+// 方法3：带验证的演示（验证定位结果是否正确）
+bool success = run_aes_dfa_verified_demo();
+```
+
+### 输出示例
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║          AES白盒加密 DFA攻击定位报告                          ║
+╚══════════════════════════════════════════════════════════════╝
+
+▶ 追踪统计:
+  - EOR指令数量: 256
+  - 密钥读取数量: 176
+  - 第10轮密钥操作: 16
+
+▶ 第10轮密钥地址: 0x7f8a003200
+
+▶ 第10轮AddRoundKey操作点 (DFA攻击目标):
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Byte  │     PC      │ Key  │ State_Before │ State_After   │
+  ├─────────────────────────────────────────────────────────────┤
+  │   0   │ 0x7f8a1234 │ 0xD0 │     0x63     │     0xB3      │
+  │   1   │ 0x7f8a1238 │ 0xC9 │     0x7C     │     0xB5      │
+  │  ...  │    ...      │ ...  │     ...      │     ...       │
+  └─────────────────────────────────────────────────────────────┘
+
+▶ DFA攻击指南:
+  1. 在第9轮MixColumns输出处注入单字节故障
+  2. 故障会通过第10轮SubBytes和ShiftRows传播
+  3. 比较正确密文和错误密文的差异
+  4. 使用差分分析恢复第10轮密钥
+  5. 通过密钥逆扩展恢复原始密钥
+```
+
+### DFA攻击原理
+
+```
+AES第10轮结构（无MixColumns）:
+                ┌─────────────────────────────────────────┐
+                │                                         │
+State ───► SubBytes ───► ShiftRows ───► AddRoundKey ───► Ciphertext
+                                              ↑
+                                              │
+                                         Round 10 Key
+                                         (DFA恢复目标)
+
+故障注入点:
+                第9轮                        第10轮
+  ... ──► MixColumns ──► AddRoundKey ──► SubBytes ──► ...
+                ↑
+                │
+           故障注入点
+        (单字节故障会影响4个密文字节)
+```
+
+### 密钥恢复流程
+
+1. **收集正确密文 C**
+2. **注入故障获得错误密文 C'**
+3. **计算差异 ΔC = C ⊕ C'**
+4. **候选分析**：
+   - 对每个受影响的字节，遍历所有可能的密钥值 (0x00-0xFF)
+   - 逆推SubBytes，验证差分是否符合MixColumns特性
+5. **交叉验证**：重复故障注入2-4次，取候选集交集
+6. **密钥逆扩展**：从第10轮密钥恢复原始密钥
+
+### API参考
+
+| 类/函数 | 描述 |
+|---------|------|
+| `AESDFADemo::getInstance()` | 获取DFA分析器单例 |
+| `AESDFADemo::set_round10_key_addr()` | 设置第10轮密钥地址 |
+| `AESDFADemo::start_trace()` | 开始DFA追踪 |
+| `AESDFADemo::analyze()` | 分析并生成报告 |
+| `AESDFADemo::print_attack_guide()` | 打印攻击指南 |
+| `run_aes_dfa_demo()` | 运行完整演示 |
+| `run_aes_dfa_verified_demo()` | 运行带验证的演示 |
+
+---
+
 ## 版本历史
 
 | 版本 | 日期 | 更新内容 |
 |------|------|----------|
+| 1.1.0 | 2025-12-10 | 新增AES白盒DFA攻击定位功能 |
 | 1.0.0 | 2025-12-09 | 初始版本，支持基本污点分析 |
 
 ---
