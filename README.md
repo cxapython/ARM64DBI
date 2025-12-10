@@ -130,6 +130,15 @@ class DBI {
     
     // 获取用户回调函数指针
     static DBICallback get_dbi_callback();
+    
+    // 获取 Capstone 句柄（用于寄存器名称查询等）
+    static csh get_cs_handle();
+    
+    // 打印 DBI 当前状态（调试用）
+    static void dump_status();
+    
+    // 释放 DBI 资源
+    static void destroy();
 };
 ```
 
@@ -158,12 +167,16 @@ class Translator {
     static void scan(uint64_t target_addr, BlockMeta* block_meta, ROUTER_TYPE type);
     
     // 各类指令的翻译处理
-    static void b_ins_handle(uint32_t*& writer, uint64_t pc);      // B 指令
-    static void bl_ins_handle(uint32_t*& writer, uint64_t pc);     // BL 指令
-    static void br_ins_handle(uint32_t*& writer, uint64_t pc);     // BR 指令
-    static void b_cond_ins_handle(uint32_t*& writer, uint64_t pc); // B.cond 条件跳转
-    static void adrp_ins_handle(uint32_t*& writer, uint64_t pc);   // ADRP 地址计算
-    static void ret_ins_handle(uint32_t*& writer, uint64_t pc);    // RET 返回
+    static void b_ins_handle(uint32_t*& writer, uint64_t pc);       // B 无条件跳转
+    static void bl_ins_handle(uint32_t*& writer, uint64_t pc);      // BL 函数调用
+    static void br_ins_handle(uint32_t*& writer, uint64_t pc);      // BR 间接跳转
+    static void blr_ins_handle(uint32_t*& writer, uint64_t pc);     // BLR 间接调用 (新增)
+    static void b_cond_ins_handle(uint32_t*& writer, uint64_t pc);  // B.cond 条件跳转
+    static void cbz_ins_handle(uint32_t*& writer, uint64_t pc, bool is_cbnz); // CBZ/CBNZ (新增)
+    static void tbz_ins_handle(uint32_t*& writer, uint64_t pc, bool is_tbnz); // TBZ/TBNZ (新增)
+    static void adrp_ins_handle(uint32_t*& writer, uint64_t pc);    // ADRP 大范围地址
+    static void adr_ins_handle(uint32_t*& writer, uint64_t pc);     // ADR 小范围地址 (新增)
+    static void ret_ins_handle(uint32_t*& writer, uint64_t pc);     // RET 返回
     static void default_ins_handle(uint32_t*& writer, uint64_t pc); // 普通指令
     
     // 插入回调代码
@@ -657,13 +670,17 @@ void detailed_callback(const CPU_CONTEXT* ctx) {
 | 指令类型 | 处理方式 | 说明 |
 |----------|----------|------|
 | 普通算术/逻辑 | 直接复制 | ADD, SUB, AND, ORR 等 |
-| 内存访问 | 直接复制 | LDR, STR, LDP, STP 等 |
+| 内存访问 | 直接复制 | LDR, STR, LDP, STP, LDUR, STUR 等 |
 | B (无条件跳转) | 翻译 + Router | 计算目标地址，跳转到 Router |
 | B.cond (条件跳转) | 翻译 + Router | 保持条件，调整跳转目标 |
 | BL (函数调用) | 翻译 + Router | 设置 LR 后跳转到 Router |
 | BR (间接跳转) | 翻译 + Router | 从寄存器获取目标地址 |
+| **BLR (间接调用)** | 翻译 + Router | 从寄存器获取调用目标，设置 LR |
 | RET (返回) | 翻译 + Router | 从 LR 获取返回地址 |
-| ADRP (地址计算) | 重新计算 | 将 PC 相对地址转为绝对地址 |
+| ADRP (大范围地址) | 重新计算 | 将 PC 相对页地址转为绝对地址 |
+| **ADR (小范围地址)** | 重新计算 | 将 PC 相对地址转为绝对地址 |
+| **CBZ/CBNZ** | 翻译 + Router | 比较寄存器与零并分支 |
+| **TBZ/TBNZ** | 翻译 + Router | 测试指定位并分支 |
 
 ### PC 相关指令处理
 
@@ -752,6 +769,44 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 - 翻译后的代码存储在 RWX 内存中
 - 生产环境中应考虑安全加固措施
 - 避免追踪不受信任的代码
+
+---
+
+## 更新日志
+
+### v1.1.0 (2024-12-10)
+
+#### 新增指令支持
+- **BLR** - 间接函数调用指令
+- **CBZ/CBNZ** - 比较并分支指令
+- **TBZ/TBNZ** - 测试位并分支指令
+- **ADR** - PC 相对地址计算指令（小范围）
+
+#### 污点分析增强
+- 修复 LDP/STP 双寄存器污点传播
+- 添加 LDUR/STUR 非对齐内存访问支持
+- 添加条件选择指令 (CSEL/CSINC/CSINV/CSNEG) 污点传播
+- 添加字节序反转指令 (REV/REV16/REV32/REV64/RBIT) 污点传播
+- 添加位域操作指令 (UBFM/SBFM/BFM/EXTR) 污点传播
+- 添加扩展指令 (SXTB/SXTH/SXTW/UXTB/UXTH) 污点传播
+- 添加位计数指令 (CLZ/CLS/CNT) 污点传播
+
+#### 健壮性提升
+- Memory 类添加内存池状态检查和诊断方法
+- DBI 类添加参数验证和状态检查
+- Translator 添加安全限制防止基本块溢出
+- 添加 `DBI::dump_status()` 调试方法
+- 添加 `DBI::destroy()` 资源清理方法
+
+#### 代码质量
+- 全部核心代码添加详细中文注释
+- 修复编译警告
+- 限制只编译 arm64-v8a 架构
+
+### v1.0.0 (初始版本)
+- 基础 DBI 框架实现
+- 支持 B/BL/BR/RET/B.cond/ADRP 指令
+- 基本污点分析功能
 
 ---
 
